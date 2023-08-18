@@ -93,6 +93,11 @@ def space_time_molchan_test(raster_dict,
                             healpix_resolution=128,
                             distance_max = DEFAULT_DISTANCE_MAX, 
                             distance_step = DEFAULT_DISTANCE_STEP):
+    """
+    Given a raster sequence and a set of point distances already extracted from them, 
+    compute a molchan test result where the grid fraction is summed over all rasters
+    in the sequence
+    """
     
     hp = PointDistributionOnSphere(distribution_type='healpix', N=128)
 
@@ -129,6 +134,11 @@ def space_time_molchan_test(raster_dict,
 
 
 def combine_raster_sequences(raster_dict1, raster_dict2):
+    """
+    Given two raster sequences (dictionaries with coincident keys), 
+    generate a new raster sequence that multiplies the coincident rasters
+    from each sequence
+    """
     
     raster_dict3 = OrderedDict()
 
