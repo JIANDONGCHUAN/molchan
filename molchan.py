@@ -2,8 +2,10 @@ import numpy as np
 import pandas as pd
 import pygmt
 from gprm import PointDistributionOnSphere
-from collections import OrderedDict
 from gprm.utils.proximity import contour_proximity, polyline_proximity, polygons_buffer, reconstruct_and_rasterize_polygons
+from gprm.utils.create_gpml import gpml2gdf
+
+from collections import OrderedDict
 
 
 DEFAULT_DISTANCE_MAX = 1e7
@@ -201,13 +203,20 @@ def generate_distance_raster_sequence(target_features,
                                       sampling=DEFAULT_GEOGRAPHIC_SAMPLING,
                                       region=DEFAULT_GEOGRAPHIC_EXTENT):
     
+    
+    
     prox_grid_sequence = OrderedDict()
     
     for reconstruction_time in reconstruction_times:
-        #generate distance raster, masked against the permissive area
-        r_target_features = reconstruction_model.reconstruct(target_features, 
-                                                             reconstruction_time, 
-                                                             use_tempfile=False)
+        if isinstance(target_features, dict):
+        
+            r_target_features = gpml2gdf(target_features[reconstruction_time])
+    
+        else:
+            #generate distance raster, masked against the permissive area
+            r_target_features = reconstruction_model.reconstruct(target_features, 
+                                                                 reconstruction_time, 
+                                                                 use_tempfile=False)
 
         if r_target_features is not None:
             prox_grid = polyline_proximity(r_target_features,
