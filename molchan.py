@@ -1,8 +1,9 @@
 import numpy as np
 import pandas as pd
 import pygmt
+from scipy.interpolate import RegularGridInterpolator
 from gprm import PointDistributionOnSphere
-from gprm.utils.proximity import contour_proximity, polyline_proximity, polygons_buffer, reconstruct_and_rasterize_polygons
+from gprm.utils.proximity import contour_proximity, polyline_proximity, polygons_buffer, boundary_proximity, reconstruct_and_rasterize_polygons
 from gprm.utils.create_gpml import gpml2gdf
 
 from collections import OrderedDict
@@ -14,12 +15,17 @@ DEFAULT_GEOGRAPHIC_EXTENT = [-180.,180.,-90.,90.]
 DEFAULT_GEOGRAPHIC_SAMPLING = 0.25
 
 
+def scipy_interpolater(da, points):
+    f = RegularGridInterpolator((da.x.data,da.y.data), da.data.T, method='linear')
+    return f(points)
+
 
 def molchan_test(grid, 
                  points, 
                  distance_max = DEFAULT_DISTANCE_MAX, 
                  distance_step = DEFAULT_DISTANCE_STEP,
-                 buffer_radius=1):
+                 buffer_radius=1,
+                 interpolater='pygmt'):
     """
     Molchan test for a set of points against one grid
     """
@@ -27,12 +33,16 @@ def molchan_test(grid,
     earth_area = (6371.**2)*(4*np.pi)
     
     # distance of each point to the target
-    points['distance'] = pygmt.grdtrack(points=pd.DataFrame(data=points[['Longitude','Latitude']]), 
-                                        grid=grid, 
-                                        no_skip=False, 
-                                        interpolation='l',
-                                        radius=buffer_radius,
-                                        newcolname='dist')['dist']
+    if interpolater=='scipy':
+        points['distance'] = scipy_interpolater(grid, points[['Longitude','Latitude']])
+        
+    else:
+        points['distance'] = pygmt.grdtrack(points=pd.DataFrame(data=points[['Longitude','Latitude']]), 
+                                            grid=grid, 
+                                            no_skip=False, 
+                                            interpolation='l',
+                                            radius=buffer_radius,
+                                            newcolname='dist')['dist']
     
     # percentage of target distance grid within each contour level
     grid_histogram = pygmt.grdvolume(grid, contour=[0, distance_max, distance_step], f='g', unit='k')
@@ -60,7 +70,9 @@ def molchan_point(grid,
                   distance_max = DEFAULT_DISTANCE_MAX, 
                   distance_step = DEFAULT_DISTANCE_STEP, 
                   buffer_radius=1, 
-                  verbose=False):
+                  interpolater='pygmt',
+                  verbose=False,
+                  return_fraction=True):
     """
     Molchan test for a single point
     """
@@ -68,12 +80,19 @@ def molchan_point(grid,
     earth_area = (6371.**2)*(4*np.pi)
     
     # distance of each point to the target
-    points['distance'] = pygmt.grdtrack(grid=grid,
-                                        points=points[['Longitude','Latitude']], 
-                                        no_skip=False, 
-                                        interpolation='l',
-                                        radius=buffer_radius,
-                                        newcolname='dist')['dist']
+    if interpolater=='scipy':
+        points['distance'] = scipy_interpolater(grid, points[['Longitude','Latitude']])
+    else:
+        points['distance'] = pygmt.grdtrack(grid=grid,
+                                            points=points[['Longitude','Latitude']], 
+                                            no_skip=False, 
+                                            interpolation='l',
+                                            radius=buffer_radius,
+                                            newcolname='dist')['dist']
+        
+    if not return_fraction:
+        return float(points['distance'].values)
+    
     # percentage of target distance grid within each contour level
     grid_histogram = pygmt.grdvolume(grid, contour=[0, distance_max, distance_step], 
                                      f='g', unit='k', verbose='e')
@@ -93,8 +112,9 @@ def molchan_point(grid,
 def space_time_molchan_test(raster_dict, 
                             point_distances,
                             healpix_resolution=128,
-                            distance_max = DEFAULT_DISTANCE_MAX, 
-                            distance_step = DEFAULT_DISTANCE_STEP):
+                            distance_max=DEFAULT_DISTANCE_MAX, 
+                            distance_step=DEFAULT_DISTANCE_STEP,
+                            interpolater='pygmt'):
     """
     Given a raster sequence and a set of point distances already extracted from them, 
     compute a molchan test result where the grid fraction is summed over all rasters
@@ -102,19 +122,24 @@ def space_time_molchan_test(raster_dict,
     """
     
     hp = PointDistributionOnSphere(distribution_type='healpix', N=128)
+    hp_dataframe = pd.DataFrame(data={'x':hp.longitude, 'y':hp.latitude})
 
     space_time_distances = []
 
     for reconstruction_time in raster_dict.keys():
-        smpl = pygmt.grdtrack(
-            grid=raster_dict[reconstruction_time], 
-            points=pd.DataFrame(data={'x':hp.longitude, 'y':hp.latitude}), 
-            no_skip=False,
-            interpolation='l',
-            newcolname='distance'
-        )
-
-        space_time_distances.extend(smpl['distance'].dropna().tolist())
+        if interpolater=='scipy':
+            smpl = scipy_interpolater(raster_dict[reconstruction_time], 
+                                      hp_dataframe)
+            space_time_distances.extend(smpl[np.isfinite(smpl)].tolist())
+        else:
+            smpl = pygmt.grdtrack(
+                grid=raster_dict[reconstruction_time], 
+                points=hp_dataframe, 
+                no_skip=False,
+                interpolation='l',
+                newcolname='distance'
+            )
+            space_time_distances.extend(smpl['distance'].dropna().tolist())
 
     # Determine for both the grids and the points, the fraction of overall
     # points within each distance contour
@@ -151,7 +176,11 @@ def combine_raster_sequences(raster_dict1, raster_dict2):
 
     
 
-def space_time_distances(raster_dict, gdf, age_field_name='age'):
+def space_time_distances(raster_dict, gdf, age_field_name='age', 
+                         distance_max=DEFAULT_DISTANCE_MAX, 
+                         distance_step=DEFAULT_DISTANCE_STEP, 
+                         buffer_radius=1,
+                         interpolater='pygmt'):
     """
     Computes the distances to targets rconstructed to their time of appearance 
     from a raster sequence of raster grids
@@ -165,7 +194,12 @@ def space_time_distances(raster_dict, gdf, age_field_name='age'):
         reconstruction_time = row[age_field_name]
         result = molchan_point(raster_dict[reconstruction_time],
                                pd.DataFrame(data={'Longitude': [row.geometry.x], 
-                                                  'Latitude': [row.geometry.y]}))
+                                                  'Latitude': [row.geometry.y]}),
+                               distance_max=distance_max, 
+                               distance_step=distance_step, 
+                               buffer_radius=buffer_radius, 
+                               interpolater=interpolater,
+                               )
         results.append(result)
 
     return pd.DataFrame(data=results, 
@@ -176,7 +210,8 @@ def space_time_distances(raster_dict, gdf, age_field_name='age'):
 def generate_raster_sequence_from_polygons(features,
                                            rotation_model,
                                            reconstruction_times,
-                                           sampling=DEFAULT_GEOGRAPHIC_SAMPLING):
+                                           sampling=DEFAULT_GEOGRAPHIC_SAMPLING,
+                                           buffer_distance=None):
     """
     Given some reconstrutable polygon features, generates a series of 
     """
@@ -191,6 +226,11 @@ def generate_raster_sequence_from_polygons(features,
                                                  sampling=sampling)
 
         tmp = tmp.where(tmp!=0, np.nan)
+    
+        if buffer_distance is not None:
+            bn = boundary_proximity(tmp)
+            tmp.data[bn.data<=buffer_distance] = 1
+    
         raster_dict[reconstruction_time] = tmp
         
     return raster_dict
