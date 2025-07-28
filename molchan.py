@@ -121,7 +121,7 @@ def space_time_molchan_test(raster_dict,
     in the sequence
     """
     
-    hp = PointDistributionOnSphere(distribution_type='healpix', N=128)
+    hp = PointDistributionOnSphere(distribution_type='healpix', N=healpix_resolution)
     hp_dataframe = pd.DataFrame(data={'x':hp.longitude, 'y':hp.latitude})
 
     space_time_distances = []
