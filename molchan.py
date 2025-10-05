@@ -6,9 +6,8 @@ from gprm import PointDistributionOnSphere
 from gprm.utils.proximity import contour_proximity, polyline_proximity, polygons_buffer, boundary_proximity, reconstruct_and_rasterize_polygons
 from gprm.utils.create_gpml import gpml2gdf
 
-# 新增：多线程依赖库
+# 多进程依赖库
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from functools import partial
 
 from collections import OrderedDict
 
@@ -19,6 +18,51 @@ DEFAULT_GEOGRAPHIC_EXTENT = [-180., 180., -90., 90.]
 DEFAULT_GEOGRAPHIC_SAMPLING = 0.25
 
 
+# -------------------------- 顶层函数：解决多进程 pickle 问题 --------------------------
+# 1. 用于 generate_raster_sequence_from_polygons 的单时间步处理
+def _process_raster_single_time(args):
+    """顶层函数：处理单个时间步的多边形栅格生成"""
+    features, rotation_model, reconstruction_time, sampling, buffer_distance = args
+    # 核心逻辑（与原内部函数一致）
+    tmp = reconstruct_and_rasterize_polygons(
+        features, rotation_model, reconstruction_time, sampling=sampling
+    )
+    tmp = tmp.where(tmp != 0, np.nan)
+    
+    if buffer_distance is not None:
+        bn = boundary_proximity(tmp)
+        tmp.data[bn.data <= buffer_distance] = 1
+    
+    return reconstruction_time, tmp
+
+
+# 2. 用于 generate_distance_raster_sequence 的单时间步处理
+def _process_distance_single_time(args):
+    """顶层函数：处理单个时间步的距离栅格生成"""
+    target_features, reconstruction_model, reconstruction_time, sampling, region = args
+    # 核心逻辑（与原内部函数一致，修复 tmp 未定义 bug）
+    if isinstance(target_features, dict):
+        r_target_features = gpml2gdf(target_features[reconstruction_time])
+    else:
+        r_target_features = reconstruction_model.reconstruct(
+            target_features, reconstruction_time, use_tempfile=False
+        )
+    
+    # 生成距离栅格（无目标特征时生成空栅格）
+    if r_target_features is not None:
+        prox_grid = polyline_proximity(
+            r_target_features, spacing=sampling, region=region
+        )
+    else:
+        # 生成与区域匹配的空栅格（np.nan 填充）
+        lon = np.arange(region[0], region[1] + sampling, sampling)
+        lat = np.arange(region[2], region[3] + sampling, sampling)
+        prox_grid = np.ones((len(lat), len(lon))) * np.nan
+    
+    return reconstruction_time, prox_grid
+
+
+# -------------------------- 原有函数（仅修改多进程调用逻辑） --------------------------
 def scipy_interpolater(da, points):
     f = RegularGridInterpolator((da.x.data, da.y.data), da.data.T, method='linear')
     return f(points)
@@ -227,7 +271,7 @@ def generate_raster_sequence_from_polygons(features,
                                            reconstruction_times,
                                            sampling=DEFAULT_GEOGRAPHIC_SAMPLING,
                                            buffer_distance=None,
-                                           max_workers=None):  # 新增：max_workers参数
+                                           max_workers=None):
     """
     Given some reconstructable polygon features, generates a series of 
     raster grids (one per reconstruction time)
@@ -235,26 +279,17 @@ def generate_raster_sequence_from_polygons(features,
     
     raster_dict = OrderedDict()
 
-    # 内部函数：处理单个时间步的栅格生成（用于多线程）
-    def _process_single_time(reconstruction_time):
-        # 原单线程逻辑（不变）
-        tmp = reconstruct_and_rasterize_polygons(
-            features, rotation_model, reconstruction_time, sampling=sampling
-        )
-        tmp = tmp.where(tmp != 0, np.nan)
-        
-        if buffer_distance is not None:
-            bn = boundary_proximity(tmp)
-            tmp.data[bn.data <= buffer_distance] = 1
-        
-        return reconstruction_time, tmp  # 返回（时间步，对应栅格）
+    # 准备参数列表（将所有参数打包成元组，传给顶层处理函数）
+    args_list = [
+        (features, rotation_model, t, sampling, buffer_distance) 
+        for t in reconstruction_times
+    ]
 
-    # 多线程执行：并行处理所有时间步
+    # 多进程执行（调用顶层函数 _process_raster_single_time）
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        # 提交所有时间步任务到线程池
-        futures = [executor.submit(_process_single_time, t) for t in reconstruction_times]
+        futures = [executor.submit(_process_raster_single_time, args) for args in args_list]
         
-        # 收集结果（按时间步顺序存入字典，保证输出顺序与输入一致）
+        # 收集结果（保证时间步顺序）
         for future in as_completed(futures):
             t, raster = future.result()
             raster_dict[t] = raster
@@ -267,7 +302,7 @@ def generate_distance_raster_sequence(target_features,
                                       reconstruction_times,
                                       sampling=DEFAULT_GEOGRAPHIC_SAMPLING,
                                       region=DEFAULT_GEOGRAPHIC_EXTENT,
-                                      max_workers=None):  # 新增：max_workers参数
+                                      max_workers=None):
     """
     Generates a sequence of distance rasters (one per reconstruction time)
     from target polyline features
@@ -275,33 +310,15 @@ def generate_distance_raster_sequence(target_features,
     
     prox_grid_sequence = OrderedDict()
 
-    # 内部函数：处理单个时间步的距离栅格生成（用于多线程）
-    def _process_single_time(reconstruction_time):
-        # 原单线程逻辑（修复原代码中tmp未定义的bug）
-        if isinstance(target_features, dict):
-            r_target_features = gpml2gdf(target_features[reconstruction_time])
-        else:
-            r_target_features = reconstruction_model.reconstruct(
-                target_features, reconstruction_time, use_tempfile=False
-            )
-        
-        # 生成距离栅格（无目标特征时生成空栅格，避免报错）
-        if r_target_features is not None:
-            prox_grid = polyline_proximity(
-                r_target_features, spacing=sampling, region=region
-            )
-        else:
-            # 生成与区域匹配的空栅格（用np.nan填充）
-            lon = np.arange(region[0], region[1] + sampling, sampling)
-            lat = np.arange(region[2], region[3] + sampling, sampling)
-            prox_grid = np.ones((len(lat), len(lon))) * np.nan
-        
-        return reconstruction_time, prox_grid  # 返回（时间步，对应距离栅格）
+    # 准备参数列表（打包参数传给顶层处理函数）
+    args_list = [
+        (target_features, reconstruction_model, t, sampling, region) 
+        for t in reconstruction_times
+    ]
 
-    # 多线程执行：并行处理所有时间步
+    # 多进程执行（调用顶层函数 _process_distance_single_time）
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        # 提交所有时间步任务到线程池
-        futures = [executor.submit(_process_single_time, t) for t in reconstruction_times]
+        futures = [executor.submit(_process_distance_single_time, args) for args in args_list]
         
         # 收集结果（保证时间步顺序）
         for future in as_completed(futures):
